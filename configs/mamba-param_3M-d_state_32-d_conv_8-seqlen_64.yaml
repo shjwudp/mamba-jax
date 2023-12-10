@@ -1,0 +1,22 @@
+model:
+  seqlen: 128
+  d_model: 64
+  d_inner: 128
+  d_state: 32
+  d_conv: 8
+  n_layer: 2
+  vocab_size: 50257
+  rms_norm: true
+  residual_in_fp32: false
+  fused_add_norm: false
+  pad_vocab_size_multiple: 8
+  bf16: true
+data:
+  path: "tiny_shakespeare"
+tokenizer:
+  path: "gpt2"
+
+train:
+  batch_size: 16
+  learning_rate: 1e-2
+  log_interval: 10
