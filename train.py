@@ -1,5 +1,7 @@
 from mamba_ssm_jax.modules.mamba_simple import Mamba, MambaLMHeadModel
 
+import time
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -56,7 +58,7 @@ def get_initial_params(cfg, model, print_tabulate=True):
     seqlen = cfg.model.seqlen
     bs = cfg.train.batch_size
 
-    key = jax.random.key(0)
+    key = jax.random.PRNGKey(42)
     variables = model.init(key, jnp.empty((bs, seqlen), dtype=jnp.int32))
     if print_tabulate:
         model_info = model.tabulate(key, jnp.empty((bs, seqlen), dtype=jnp.int32), compute_flops=True, compute_vjp_flops=True)
@@ -73,37 +75,59 @@ def get_model_and_train_state(cfg):
 
     tx = optax.adamw(cfg.train.learning_rate)
     state = train_state.TrainState.create(
-        apply_fn=model.apply, params=params, tx=tx
+        apply_fn=model.apply, params=params, tx=tx,
     )
     return model, state
 
-def grad_norm(grads):
+
+def flatten_norm(grads):
     flat_grads, _ = jax.tree_util.tree_flatten(grads)
     flat_grads = jnp.concatenate([jnp.reshape(g, -1) for g in flat_grads])
     return jnp.sqrt(jnp.sum(jnp.square(flat_grads))).item()
 
 
-def train_step(cfg : DictConfig, state: train_state.TrainState, input_ids: jax.Array):
+def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array):
     """Trains one step."""
-    inputs = input_ids[:, :-1]
-    labels = input_ids[:, 1:]
+    B = batch.shape[0]
+    mbs = cfg.train.micro_batch_size
+    vocab_size = cfg.model.vocab_size
+    assert B % mbs == 0
+    num_micro_batches = B // mbs
 
-    def loss_fn(params):
+    @jax.jit
+    def compute_loss(params, input_ids):
+        inputs = input_ids[:, :-1]
+        labels = input_ids[:, 1:]
+
         output = state.apply_fn(
             {'params': params},
             inputs,
         )
-        targets = jax.nn.one_hot(labels, num_classes=cfg.model.vocab_size)
+        targets = jax.nn.one_hot(labels, num_classes=vocab_size)
         loss = optax.softmax_cross_entropy(output.logits, targets)
         return loss.mean(), output.logits
+    
+    grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, _), grads = grad_fn(state.params)
+    accum_grads = None
+    accum_loss = 0.
+    for idx in range(num_micro_batches):
+        minibatch = batch[idx * mbs: (idx + 1) * mbs, :]
+        (loss, _), grads = grad_fn(state.params, minibatch)
+        grads = jax.tree_map(lambda x: x / num_micro_batches, grads)
+        if accum_grads:
+            grads = jax.tree_map(jnp.add, accum_grads, grads)
+        accum_grads = grads
+        accum_loss += loss
+
+    grads = accum_grads
+    loss = accum_loss / num_micro_batches
+
     state = state.apply_gradients(grads=grads)
     metrics = {
-        "Train Loss": loss.item(),
-        "Grads Norm": grad_norm(grads),
-        "Parameters Norm": grad_norm(state.params),
+        "Train Loss": loss.mean().item(),
+        "Grads Norm": flatten_norm(grads),
+        "Parameters Norm": flatten_norm(state.params),
     }
 
     return state, metrics
@@ -125,7 +149,7 @@ def evaluate(cfg, test_dataloader, model, params):
     return sum(losses) / len(losses)
 
 
-@hydra.main(version_base="1.1", config_path="configs", config_name="config.yaml")
+@hydra.main(version_base="1.1", config_path="configs", config_name="mamba-param_3M-d_state_32-d_conv_8-seqlen_64.yaml")
 def train_and_evaluate_mamba(cfg : DictConfig):
     wandb.init(project="mamba", config=OmegaConf.to_container(cfg))
 
@@ -143,14 +167,19 @@ def train_and_evaluate_mamba(cfg : DictConfig):
     )
     test_dataloader = DataLoader(dataset["test"], batch_size=1)
 
+    step_time_stack = []
     model, state = get_model_and_train_state(cfg)
     for idx, batch in enumerate(train_dataloader, start=1):
         input_ids = [x.numpy() for x in batch["input_ids"]]
         input_ids = rearrange(jnp.array(input_ids), "L B -> B L")
-        state, metrics = train_step(cfg, state, input_ids, )
+        start_time = time.time()
+        state, metrics = train_step(cfg, state, input_ids)
+        step_time_stack.append(time.time() - start_time)
         if idx % cfg.train.log_interval == 0:
             eval_loss = evaluate(cfg, test_dataloader, model, state.params)
             metrics["Validation Loss"] = eval_loss.item()
+            metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
+            step_time_stack = []
             wandb.log(metrics, step=idx)
             print(f"step-{idx}", metrics)
 
