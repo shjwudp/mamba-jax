@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from einops import rearrange
 import wandb
+from rich.console import Console
 
 
 def get_model(cfg):
@@ -61,7 +62,7 @@ def get_initial_params(cfg, model, print_tabulate=True):
     key = jax.random.PRNGKey(42)
     variables = model.init(key, jnp.empty((bs, seqlen), dtype=jnp.int32))
     if print_tabulate:
-        model_info = model.tabulate(key, jnp.empty((bs, seqlen), dtype=jnp.int32), compute_flops=True, compute_vjp_flops=True)
+        model_info = model.tabulate(key, jnp.empty((bs, seqlen), dtype=jnp.int32), compute_flops=False, compute_vjp_flops=False)
         print(model_info)
 
     return variables['params']
@@ -94,11 +95,9 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     assert B % mbs == 0
     num_micro_batches = B // mbs
 
-    @jax.jit
     def compute_loss(params, input_ids):
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-
         output = state.apply_fn(
             {'params': params},
             inputs,
@@ -152,6 +151,7 @@ def evaluate(cfg, test_dataloader, model, params):
 @hydra.main(version_base="1.1", config_path="configs", config_name="mamba-param_3M-d_state_32-d_conv_8-seqlen_64.yaml")
 def train_and_evaluate_mamba(cfg : DictConfig):
     wandb.init(project="mamba", config=OmegaConf.to_container(cfg))
+    console = Console()
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer.path)
     dataset = datasets.load_dataset(cfg.data.path)
@@ -181,7 +181,7 @@ def train_and_evaluate_mamba(cfg : DictConfig):
             metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
             step_time_stack = []
             wandb.log(metrics, step=idx)
-            print(f"step-{idx}", metrics)
+            console.log(f"step-{idx}", metrics, time.time())
 
 
 if __name__ == "__main__":
