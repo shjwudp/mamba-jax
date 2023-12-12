@@ -181,6 +181,7 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     out: r(B D L)
     last_state (optional): r(B D dstate)
     """
+    # TODO: support boundary resetting mentioned in Mamba paper 3.5.2
     dtype_in = u.dtype
     u = u.astype(jnp.float32)
     delta = delta.astype(jnp.float32)
@@ -210,4 +211,3 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
         out = out * nn.activation.silu(z)
     out = out.astype(dtype_in)
     return out if not return_last_state else (out, last_state)
-
