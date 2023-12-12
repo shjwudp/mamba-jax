@@ -8,7 +8,7 @@ At present, I am able to train a small-scale Mamba model on my MacBook. I am exc
 
 # TODOs
 
-- [ ] Implement gradient accumulation.
+- [x] Implement gradient accumulation.
 - [ ] Implement activation memory checkpoint.
 - [ ] Add GPU-aware selective scan.
 
