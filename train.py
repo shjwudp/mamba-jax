@@ -11,7 +11,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import datasets
 import dataset_utils
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DefaultDataCollator
 from torch.utils.data import DataLoader
 from einops import rearrange
 import wandb
@@ -153,35 +153,45 @@ def train_and_evaluate_mamba(cfg : DictConfig):
     wandb.init(project="mamba", config=OmegaConf.to_container(cfg))
     console = Console()
 
+    # Prepare dataset and dataloader
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer.path)
     dataset = datasets.load_dataset(cfg.data.path)
-
     dataset = dataset_utils.prepare_dataset(
         raw_dataset=dataset,
         tokenizer=tokenizer,
         seq_length=cfg.model.seqlen,
     )
-
     train_dataloader = DataLoader(
-        dataset["train"], batch_size=cfg.train.batch_size,
+        dataset["train"],
+        batch_size=cfg.train.batch_size,
+        collate_fn=DefaultDataCollator(return_tensors="np"),
     )
-    test_dataloader = DataLoader(dataset["test"], batch_size=1)
+    test_dataloader = DataLoader(
+        dataset["test"],
+        batch_size=1,
+        collate_fn=DefaultDataCollator(return_tensors="np"),
+    )
 
-    step_time_stack = []
+    # Prepare model and train state
     model, state = get_model_and_train_state(cfg)
+
+    profile = cfg.train.get("profile", None)
+    step_time_stack = []
     for idx, batch in enumerate(train_dataloader, start=1):
-        input_ids = [x.numpy() for x in batch["input_ids"]]
-        input_ids = rearrange(jnp.array(input_ids), "L B -> B L")
+        input_ids = batch["input_ids"]
         start_time = time.time()
         state, metrics = train_step(cfg, state, input_ids)
         step_time_stack.append(time.time() - start_time)
-        if idx % cfg.train.log_interval == 0:
+
+        if idx % cfg.train.eval_interval == 0:
             eval_loss = evaluate(cfg, test_dataloader, model, state.params)
             metrics["Validation Loss"] = eval_loss.item()
+
+        if idx % cfg.train.log_interval == 0:
             metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
             step_time_stack = []
             wandb.log(metrics, step=idx)
-            console.log(f"step-{idx}", metrics, time.time())
+            console.log(f"step-{idx}", metrics)
 
 
 if __name__ == "__main__":
