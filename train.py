@@ -92,7 +92,7 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     B = batch.shape[0]
     mbs = cfg.train.micro_batch_size
     vocab_size = cfg.model.vocab_size
-    assert B % mbs == 0
+    assert B % mbs == 0, f"B={B}, mbs={mbs}"
     num_micro_batches = B // mbs
 
     def compute_loss(params, input_ids):
@@ -135,8 +135,7 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
 def evaluate(cfg, test_dataloader, model, params):
     losses = []
     for batch in test_dataloader:
-        input_ids = [x.numpy() for x in batch["input_ids"]]
-        input_ids = rearrange(jnp.array(input_ids), "L B -> B L")
+        input_ids = batch["input_ids"]
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
         output = model.apply({'params': params}, inputs)
@@ -165,6 +164,7 @@ def train_and_evaluate_mamba(cfg : DictConfig):
         dataset["train"],
         batch_size=cfg.train.batch_size,
         collate_fn=DefaultDataCollator(return_tensors="np"),
+        drop_last=True,
     )
     test_dataloader = DataLoader(
         dataset["test"],
@@ -178,6 +178,9 @@ def train_and_evaluate_mamba(cfg : DictConfig):
     profile = cfg.train.get("profile", None)
     step_time_stack = []
     for idx, batch in enumerate(train_dataloader, start=1):
+        if profile and idx == profile.start_step:
+            jax.profiler.start_trace(**profile.trace_kwargs)
+
         input_ids = batch["input_ids"]
         start_time = time.time()
         state, metrics = train_step(cfg, state, input_ids)
@@ -192,6 +195,16 @@ def train_and_evaluate_mamba(cfg : DictConfig):
             step_time_stack = []
             wandb.log(metrics, step=idx)
             console.log(f"step-{idx}", metrics)
+
+        if profile and idx == profile.end_step:
+            jax.profiler.stop_trace()
+
+    if idx % cfg.train.eval_interval != 0:
+        eval_loss = evaluate(cfg, test_dataloader, model, state.params)
+        metrics["Validation Loss"] = eval_loss.item()
+
+    wandb.log(metrics, step=idx)
+    console.log(f"At the end of training, the metrics is:", metrics)
 
 
 if __name__ == "__main__":
