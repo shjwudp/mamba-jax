@@ -194,18 +194,21 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     C = C.astype(jnp.float32)
 
     x = jnp.zeros((batch, dim, dstate), dtype=A.dtype)
-    ys = []
-    deltaA = jnp.exp(jnp.einsum("bdl,dn->bdln", delta, A))
-    deltaB_u = jnp.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+    deltaA = jnp.exp(jnp.einsum("bdl,dn->lbdn", delta, A))
+    deltaB_u = jnp.einsum("bdl,bnl,bdl->lbdn", delta, B, u)
+    C = rearrange(C, "b n l -> l b n")
+
     last_state = None
-    L = u.shape[-1]
-    for i in range(L):
-        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
-        y = jnp.einsum("bdn,bn->bd", x, C[:, :, i])
-        if i == L - 1:
-            last_state = x
-        ys.append(y)
-    y = jnp.stack(ys, axis=2)
+
+    def f(x, inputs):
+        deltaA, deltaB_u, C = inputs
+        x = deltaA * x + deltaB_u
+        y = jnp.einsum("bdn,bn->bd", x, C)
+        return x, y
+
+    last_state, y = jax.lax.scan(f, x, [deltaA, deltaB_u, C])
+    y = rearrange(y, "l b d -> b d l")
+
     out = y if D is None else y + u * rearrange(D, "d -> d 1")
     if z is not None:
         out = out * nn.activation.silu(z)
