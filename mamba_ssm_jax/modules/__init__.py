@@ -1,1 +1,1 @@
-from .mamba_simple import Mamba, Block
+from .mamba_simple import Block, Mamba
