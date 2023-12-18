@@ -1,11 +1,11 @@
 import math
-from typing import Callable
 from collections import namedtuple
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from einops import rearrange, repeat
+from flax import linen as nn
 
 
 class Mamba(nn.Module):
@@ -19,7 +19,9 @@ class Mamba(nn.Module):
     use_fast_path: bool = False
 
     def setup(self):
-        self.dt_rank = math.ceil(self.d_model / 16) if self.c_dt_rank == "auto" else self.c_dt_rank
+        self.dt_rank = (
+            math.ceil(self.d_model / 16) if self.c_dt_rank == "auto" else self.c_dt_rank
+        )
         self.in_proj = nn.Dense(self.d_inner * 2, use_bias=self.bias)
         self.conv1d = nn.Conv(
             features=self.d_inner,
@@ -35,14 +37,18 @@ class Mamba(nn.Module):
         A = repeat(
             jnp.arange(1, self.d_state + 1, dtype=jnp.float32),
             "n -> d n",
-            d=self.d_inner
+            d=self.d_inner,
         )
         self.A_log = jnp.log(A)
 
         # D "skip" parameter
         self.D = jnp.ones(self.d_inner)
 
-        self.out_proj = nn.Dense(self.d_model, use_bias=self.bias, kernel_init=nn.initializers.kaiming_uniform())
+        self.out_proj = nn.Dense(
+            self.d_model,
+            use_bias=self.bias,
+            kernel_init=nn.initializers.kaiming_uniform(),
+        )
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -56,7 +62,7 @@ class Mamba(nn.Module):
 
         xz = self.in_proj(hidden_states)
 
-        A = -jnp.exp(self.A_log.astype(jnp.float32)) # (d_inner, d_state)
+        A = -jnp.exp(self.A_log.astype(jnp.float32))  # (d_inner, d_state)
         assert not self.use_fast_path
         xz = rearrange(xz, "b l (d i) -> i b l d", i=2)
         x, z = xz[0], xz[1]
@@ -64,7 +70,9 @@ class Mamba(nn.Module):
         x = nn.activation.silu(x)
 
         x_dbl = self.x_proj(x)  # (b l d)
-        dt, B, C = jnp.split(x_dbl, [self.dt_rank, self.dt_rank + self.d_state], axis=-1)
+        dt, B, C = jnp.split(
+            x_dbl, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
+        )
         dt = self.dt_proj(dt)
         x = rearrange(x, "b l d -> b d l")
         dt = rearrange(dt, "b l d -> b d l")
@@ -130,7 +138,9 @@ class MixerModel(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.vocab_size, self.dim)
         self.layers = [Block(**self.block_kwargs) for i in range(self.n_layer)]
-        self.norm_f = nn.LayerNorm(self.dim) if not self.rms_norm else nn.RMSNorm(self.dim)
+        self.norm_f = (
+            nn.LayerNorm(self.dim) if not self.rms_norm else nn.RMSNorm(self.dim)
+        )
 
     def __call__(self, input_ids):
         hidden_states = self.embedding(input_ids)
@@ -168,7 +178,18 @@ def view_as_complex(arr):
     return complex_array
 
 
-def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False):
+def selective_scan_fn(
+    u,
+    delta,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    delta_bias=None,
+    delta_softplus=False,
+    return_last_state=False,
+):
     """
     u: r(B D L)
     delta: r(B D L)
@@ -194,18 +215,21 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     C = C.astype(jnp.float32)
 
     x = jnp.zeros((batch, dim, dstate), dtype=A.dtype)
-    ys = []
-    deltaA = jnp.exp(jnp.einsum("bdl,dn->bdln", delta, A))
-    deltaB_u = jnp.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+    deltaA = jnp.exp(jnp.einsum("bdl,dn->lbdn", delta, A))
+    deltaB_u = jnp.einsum("bdl,bnl,bdl->lbdn", delta, B, u)
+    C = rearrange(C, "b n l -> l b n")
+
     last_state = None
-    L = u.shape[-1]
-    for i in range(L):
-        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
-        y = jnp.einsum("bdn,bn->bd", x, C[:, :, i])
-        if i == L - 1:
-            last_state = x
-        ys.append(y)
-    y = jnp.stack(ys, axis=2)
+
+    def f(x, inputs):
+        deltaA, deltaB_u, C = inputs
+        x = deltaA * x + deltaB_u
+        y = jnp.einsum("bdn,bn->bd", x, C)
+        return x, y
+
+    last_state, y = jax.lax.scan(f, x, [deltaA, deltaB_u, C])
+    y = rearrange(y, "l b d -> b d l")
+
     out = y if D is None else y + u * rearrange(D, "d -> d 1")
     if z is not None:
         out = out * nn.activation.silu(z)

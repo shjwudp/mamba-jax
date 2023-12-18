@@ -1,5 +1,5 @@
 model:
-  seqlen: 128
+  seqlen: 1024
   d_model: 64
   d_inner: 128
   d_state: 32
@@ -20,5 +20,12 @@ train:
   batch_size: 16
   micro_batch_size: 8
   learning_rate: 1e-2
-  log_interval: 10
-  eval_interval: 100
+  log_interval: 1
+  eval_interval: 20
+  profile:
+    start_step: 2
+    end_step: 5
+    trace_kwargs:
+      log_dir: "jax-profile"
+      create_perfetto_link: true
+      create_perfetto_trace: true

@@ -1,11 +1,8 @@
-import os
 from itertools import chain
 
 
 def fixed_seq_length_of_datasets(
-    dataset,
-    fixed_seq_length,
-    load_from_cache_file=False,
+    dataset, fixed_seq_length, load_from_cache_file=False,
 ):
     block_size = fixed_seq_length
 
@@ -37,10 +34,7 @@ def fixed_seq_length_of_datasets(
 
 
 def prepare_dataset(
-    raw_dataset,
-    tokenizer,
-    seq_length=512,
-    overwrite_cache=False,
+    raw_dataset, tokenizer, seq_length=512, overwrite_cache=False,
 ):
     column_names = raw_dataset["train"].column_names
     text_column_name = "text"
@@ -54,9 +48,7 @@ def prepare_dataset(
     )
 
     lm_dataset = fixed_seq_length_of_datasets(
-        tokenized_dataset,
-        seq_length,
-        load_from_cache_file=not overwrite_cache,
+        tokenized_dataset, seq_length, load_from_cache_file=not overwrite_cache,
     )
 
     return lm_dataset

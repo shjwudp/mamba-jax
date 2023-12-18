@@ -1,21 +1,20 @@
-from mamba_ssm_jax.modules.mamba_simple import Mamba, MambaLMHeadModel
-
 import time
 
+import datasets
+import hydra
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 import optax
+from flax import linen as nn
 from flax.training import train_state
-import hydra
 from omegaconf import DictConfig, OmegaConf
-import datasets
-import dataset_utils
-from transformers import AutoTokenizer, DefaultDataCollator
-from torch.utils.data import DataLoader
-from einops import rearrange
-import wandb
 from rich.console import Console
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, DefaultDataCollator
+
+import dataset_utils
+import wandb
+from mamba_ssm_jax.modules.mamba_simple import Mamba, MambaLMHeadModel
 
 
 def get_model(cfg):
@@ -47,9 +46,7 @@ def get_model(cfg):
         vocab_size=vocab_size,
         block_kwargs=block_config,
     )
-    mamba_lm_head_model_config = dict(
-        mixer_model_kwargs=mixer_model_config,
-    )
+    mamba_lm_head_model_config = dict(mixer_model_kwargs=mixer_model_config,)
 
     mamba_lm_head_model = MambaLMHeadModel(**mamba_lm_head_model_config)
     return mamba_lm_head_model
@@ -62,10 +59,15 @@ def get_initial_params(cfg, model, print_tabulate=True):
     key = jax.random.PRNGKey(42)
     variables = model.init(key, jnp.empty((bs, seqlen), dtype=jnp.int32))
     if print_tabulate:
-        model_info = model.tabulate(key, jnp.empty((bs, seqlen), dtype=jnp.int32), compute_flops=False, compute_vjp_flops=False)
+        model_info = model.tabulate(
+            key,
+            jnp.empty((bs, seqlen), dtype=jnp.int32),
+            compute_flops=False,
+            compute_vjp_flops=False,
+        )
         print(model_info)
 
-    return variables['params']
+    return variables["params"]
 
 
 def get_model_and_train_state(cfg):
@@ -75,9 +77,7 @@ def get_model_and_train_state(cfg):
         params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
 
     tx = optax.adamw(cfg.train.learning_rate)
-    state = train_state.TrainState.create(
-        apply_fn=model.apply, params=params, tx=tx,
-    )
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx,)
     return model, state
 
 
@@ -98,20 +98,17 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     def compute_loss(params, input_ids):
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-        output = state.apply_fn(
-            {'params': params},
-            inputs,
-        )
+        output = state.apply_fn({"params": params}, inputs,)
         targets = jax.nn.one_hot(labels, num_classes=vocab_size)
         loss = optax.softmax_cross_entropy(output.logits, targets)
         return loss.mean(), output.logits
-    
+
     grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
 
     accum_grads = None
-    accum_loss = 0.
+    accum_loss = 0.0
     for idx in range(num_micro_batches):
-        minibatch = batch[idx * mbs: (idx + 1) * mbs, :]
+        minibatch = batch[idx * mbs : (idx + 1) * mbs, :]
         (loss, _), grads = grad_fn(state.params, minibatch)
         grads = jax.tree_map(lambda x: x / num_micro_batches, grads)
         if accum_grads:
@@ -138,7 +135,7 @@ def evaluate(cfg, test_dataloader, model, params):
         input_ids = batch["input_ids"]
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-        output = model.apply({'params': params}, inputs)
+        output = model.apply({"params": params}, inputs)
         targets = jax.nn.one_hot(labels, num_classes=cfg.model.vocab_size)
         loss = optax.softmax_cross_entropy(output.logits, targets)
 
@@ -147,8 +144,12 @@ def evaluate(cfg, test_dataloader, model, params):
     return sum(losses) / len(losses)
 
 
-@hydra.main(version_base="1.1", config_path="configs", config_name="mamba-param_3M-d_state_32-d_conv_8-seqlen_64.yaml")
-def train_and_evaluate_mamba(cfg : DictConfig):
+@hydra.main(
+    version_base="1.1",
+    config_path="configs",
+    config_name="mamba-param_3M-d_state_32-d_conv_8-seqlen_64.yaml",
+)
+def train_and_evaluate_mamba(cfg: DictConfig):
     wandb.init(project="mamba", config=OmegaConf.to_container(cfg))
     console = Console()
 
@@ -156,9 +157,7 @@ def train_and_evaluate_mamba(cfg : DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer.path)
     dataset = datasets.load_dataset(cfg.data.path)
     dataset = dataset_utils.prepare_dataset(
-        raw_dataset=dataset,
-        tokenizer=tokenizer,
-        seq_length=cfg.model.seqlen,
+        raw_dataset=dataset, tokenizer=tokenizer, seq_length=cfg.model.seqlen,
     )
     train_dataloader = DataLoader(
         dataset["train"],
