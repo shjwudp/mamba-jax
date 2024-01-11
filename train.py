@@ -14,70 +14,25 @@ from transformers import AutoTokenizer, DefaultDataCollator
 
 import dataset_utils
 import wandb
-from mamba_ssm_jax.modules.mamba_simple import Mamba, MambaLMHeadModel
-
-
-def get_model(cfg):
-    d_model = cfg.d_model
-    vocab_size = cfg.vocab_size
-
-    mamba_config = dict(
-        d_model=d_model,
-        d_inner=cfg.d_inner,
-        d_state=cfg.d_state,
-        d_conv=cfg.d_conv,
-        bias=False,
-        c_dt_rank="auto",
-        conv_bias=True,
-        use_fast_path=False,
-    )
-    block_config = dict(
-        dim=d_model,
-        mixer_cls=Mamba,
-        mixer_kwargs=mamba_config,
-        norm_cls=nn.LayerNorm,
-        fused_add_norm=False,
-        residual_in_fp32=False,
-    )
-    mixer_model_config = dict(
-        dim=d_model,
-        n_layer=cfg.n_layer,
-        rms_norm=cfg.rms_norm,
-        vocab_size=vocab_size,
-        block_kwargs=block_config,
-    )
-    mamba_lm_head_model_config = dict(mixer_model_kwargs=mixer_model_config,)
-
-    mamba_lm_head_model = MambaLMHeadModel(**mamba_lm_head_model_config)
-    return mamba_lm_head_model
-
-
-def get_initial_params(cfg, model, print_tabulate=True):
-    seqlen = cfg.model.seqlen
-    bs = cfg.train.batch_size
-
-    key = jax.random.PRNGKey(42)
-    variables = model.init(key, jnp.empty((bs, seqlen), dtype=jnp.int32))
-    if print_tabulate:
-        model_info = model.tabulate(
-            key,
-            jnp.empty((bs, seqlen), dtype=jnp.int32),
-            compute_flops=False,
-            compute_vjp_flops=False,
-        )
-        print(model_info)
-
-    return variables["params"]
+from mamba_ssm_jax.modules.mamba_simple import MambaConfig, FlaxMambaLMHeadModel
 
 
 def get_model_and_train_state(cfg):
-    model = get_model(cfg.model)
-    params = get_initial_params(cfg, model)
+    config = MambaConfig(
+        d_model=cfg.model.d_model,
+        d_inner=cfg.model.d_inner,
+        d_state=cfg.model.d_state,
+        d_conv=cfg.model.d_conv,
+        n_layer=cfg.model.n_layer,
+        vocab_size=cfg.model.vocab_size,
+    )
+    model = FlaxMambaLMHeadModel(config)
+    params = model.init_weights(jax.random.PRNGKey(42), (cfg.train.batch_size, cfg.model.seqlen))
     if cfg.model.bf16:
         params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
 
-    tx = optax.adamw(cfg.train.learning_rate)
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx,)
+    adamw = optax.adamw(cfg.train.learning_rate)
+    state = train_state.TrainState.create(apply_fn=model.__call__, params=params, tx=adamw)
     return model, state
 
 
@@ -98,7 +53,7 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     def compute_loss(params, input_ids):
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-        output = state.apply_fn({"params": params}, inputs,)
+        output = state.apply_fn(inputs, params=params)
         targets = jax.nn.one_hot(labels, num_classes=vocab_size)
         loss = optax.softmax_cross_entropy(output.logits, targets)
         return loss.mean(), output.logits
@@ -129,13 +84,13 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     return state, metrics
 
 
-def evaluate(cfg, test_dataloader, model, params):
+def evaluate(cfg, test_dataloader, model):
     losses = []
     for batch in test_dataloader:
         input_ids = batch["input_ids"]
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-        output = model.apply({"params": params}, inputs)
+        output = model(inputs)
         targets = jax.nn.one_hot(labels, num_classes=cfg.model.vocab_size)
         loss = optax.softmax_cross_entropy(output.logits, targets)
 
@@ -185,24 +140,24 @@ def train_and_evaluate_mamba(cfg: DictConfig):
         state, metrics = train_step(cfg, state, input_ids)
         step_time_stack.append(time.time() - start_time)
 
-        if idx % cfg.train.eval_interval == 0:
-            eval_loss = evaluate(cfg, test_dataloader, model, state.params)
+        if idx % cfg.train.eval_interval == 0 or idx == len(train_dataloader) - 1:
+            eval_loss = evaluate(cfg, test_dataloader, model)
             metrics["Validation Loss"] = eval_loss.item()
 
-        if idx % cfg.train.log_interval == 0:
+        if idx % cfg.train.log_interval == 0 or idx == len(train_dataloader) - 1:
             metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
             step_time_stack = []
             wandb.log(metrics, step=idx)
             console.log(f"step-{idx}", metrics)
 
+        if idx % cfg.train.save_interval == 0 or idx == len(train_dataloader) - 1:
+            ckpt_dir = f"checkpoints/step-{idx}"
+            model.save_pretrained(ckpt_dir)
+            tokenizer.save_pretrained(ckpt_dir)
+
         if profile and idx == profile.end_step:
             jax.profiler.stop_trace()
 
-    if idx % cfg.train.eval_interval != 0:
-        eval_loss = evaluate(cfg, test_dataloader, model, state.params)
-        metrics["Validation Loss"] = eval_loss.item()
-
-    wandb.log(metrics, step=idx)
     console.log(f"At the end of training, the metrics is:", metrics)
 
 
