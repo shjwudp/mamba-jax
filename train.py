@@ -17,7 +17,7 @@ import wandb
 from mamba_ssm_jax.modules.mamba_simple import MambaConfig, FlaxMambaLMHeadModel
 
 
-def get_model_and_train_state(cfg):
+def get_model_and_train_state(cfg, eos_token_id):
     config = MambaConfig(
         d_model=cfg.model.d_model,
         d_inner=cfg.model.d_inner,
@@ -25,6 +25,7 @@ def get_model_and_train_state(cfg):
         d_conv=cfg.model.d_conv,
         n_layer=cfg.model.n_layer,
         vocab_size=cfg.model.vocab_size,
+        eos_token_id=eos_token_id,
     )
     model = FlaxMambaLMHeadModel(config)
     params = model.init_weights(jax.random.PRNGKey(42), (cfg.train.batch_size, cfg.model.seqlen))
@@ -127,7 +128,7 @@ def train_and_evaluate_mamba(cfg: DictConfig):
     )
 
     # Prepare model and train state
-    model, state = get_model_and_train_state(cfg)
+    model, state = get_model_and_train_state(cfg, eos_token_id=tokenizer.eos_token_id)
 
     profile = cfg.train.get("profile", None)
     step_time_stack = []
@@ -140,17 +141,19 @@ def train_and_evaluate_mamba(cfg: DictConfig):
         state, metrics = train_step(cfg, state, input_ids)
         step_time_stack.append(time.time() - start_time)
 
-        if idx % cfg.train.eval_interval == 0 or idx == len(train_dataloader) - 1:
+        if idx % cfg.train.eval_interval == 0 or idx == len(train_dataloader):
             eval_loss = evaluate(cfg, test_dataloader, model)
             metrics["Validation Loss"] = eval_loss.item()
 
-        if idx % cfg.train.log_interval == 0 or idx == len(train_dataloader) - 1:
+        if idx % cfg.train.log_interval == 0 or idx == len(train_dataloader):
+            eval_loss = evaluate(cfg, test_dataloader, model)
+            metrics["Validation Loss"] = eval_loss.item()
             metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
             step_time_stack = []
             wandb.log(metrics, step=idx)
             console.log(f"step-{idx}", metrics)
 
-        if idx % cfg.train.save_interval == 0 or idx == len(train_dataloader) - 1:
+        if idx % cfg.train.save_interval == 0 or idx == len(train_dataloader):
             ckpt_dir = f"checkpoints/step-{idx}"
             model.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)

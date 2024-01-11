@@ -24,6 +24,7 @@ class MambaConfig(PretrainedConfig):
         d_conv=8,
         n_layer=2,
         vocab_size=50257,
+        eos_token_id=50256,
         **kwargs,
     ):
         self.d_model = d_model
@@ -32,8 +33,9 @@ class MambaConfig(PretrainedConfig):
         self.d_conv = d_conv
         self.n_layer = n_layer
         self.vocab_size = vocab_size
+        self.eos_token_id = eos_token_id
 
-        super().__init__(**kwargs)
+        super().__init__(eos_token_id=eos_token_id, **kwargs)
 
 
 class Mamba(nn.Module):
@@ -217,6 +219,16 @@ class FlaxMambaLMHeadModel(FlaxPreTrainedModel):
 
         module_init_outputs = self.module.init(rngs, jnp.empty(input_shape, dtype=jnp.int32))
         return module_init_outputs["params"]
+
+    def _validate_model_class(self):
+        """Just hacky way to avoid the need to call FlaxGenerationMixin._validate_model_class()."""
+        pass
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
+        return {}
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        return model_kwargs
 
     def __call__(
         self,
