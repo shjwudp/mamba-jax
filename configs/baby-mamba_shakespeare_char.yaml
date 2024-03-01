@@ -1,0 +1,25 @@
+model:
+  seqlen: 256
+  d_model: 384
+  d_inner: 768
+  d_state: 16
+  d_conv: 4
+  n_layer: 12
+  vocab_size: 384
+  rms_norm: true
+  residual_in_fp32: false
+  fused_add_norm: false
+  pad_vocab_size_multiple: 8
+  bf16: true
+data:
+  path: "tiny_shakespeare"
+tokenizer:
+  path: "google/byt5-large"
+
+train:
+  batch_size: 64
+  micro_batch_size: 64
+  learning_rate: 1e-2
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 100
