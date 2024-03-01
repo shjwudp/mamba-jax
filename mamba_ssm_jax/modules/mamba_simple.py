@@ -25,6 +25,7 @@ class MambaConfig(PretrainedConfig):
         n_layer=2,
         vocab_size=50257,
         eos_token_id=50256,
+        initializer_range=0.02,
         **kwargs,
     ):
         self.d_model = d_model
@@ -34,12 +35,14 @@ class MambaConfig(PretrainedConfig):
         self.n_layer = n_layer
         self.vocab_size = vocab_size
         self.eos_token_id = eos_token_id
+        self.initializer_range = initializer_range
 
         super().__init__(eos_token_id=eos_token_id, **kwargs)
 
 
 class Mamba(nn.Module):
     config: MambaConfig
+    dtype: jnp.dtype = jnp.float32
     bias: bool = False
     c_dt_rank: str = "auto"
     conv_bias: bool = True
@@ -54,16 +57,17 @@ class Mamba(nn.Module):
         self.dt_rank = (
             math.ceil(d_model / 16) if self.c_dt_rank == "auto" else self.c_dt_rank
         )
-        self.in_proj = nn.Dense(d_inner * 2, use_bias=self.bias)
+        self.in_proj = nn.Dense(d_inner * 2, use_bias=self.bias, dtype=self.dtype)
         self.conv1d = nn.Conv(
             features=d_inner,
             use_bias=self.conv_bias,
             kernel_size=(d_conv,),
             feature_group_count=d_inner,
             padding="SAME",
+            dtype=self.dtype,
         )
-        self.x_proj = nn.Dense(self.dt_rank + d_state * 2, use_bias=False)
-        self.dt_proj = nn.Dense(d_inner, use_bias=True)
+        self.x_proj = nn.Dense(self.dt_rank + d_state * 2, use_bias=False, dtype=self.dtype)
+        self.dt_proj = nn.Dense(d_inner, use_bias=True, dtype=self.dtype)
 
         # S4D real initialization
         A = repeat(
@@ -80,6 +84,7 @@ class Mamba(nn.Module):
             d_model,
             use_bias=self.bias,
             kernel_init=nn.initializers.kaiming_uniform(),
+            dtype=self.dtype,
         )
 
     @nn.compact
@@ -89,7 +94,6 @@ class Mamba(nn.Module):
         Returns: same shape as hidden_states
         """
         d_state = self.config.d_state
-        batch, seqlen, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
 
@@ -135,14 +139,15 @@ class Mamba(nn.Module):
 
 class Block(nn.Module):
     config: MambaConfig
+    dtype: jnp.dtype = jnp.float32
     mixer_cls: Callable = Mamba
     norm_cls: Callable = nn.LayerNorm
     fused_add_norm: bool = False
     residual_in_fp32: bool = False
 
     def setup(self):
-        self.mixer = self.mixer_cls(self.config)
-        self.norm = self.norm_cls(self.config.d_model)
+        self.mixer = self.mixer_cls(self.config, dtype=self.dtype)
+        self.norm = self.norm_cls(self.config.d_model, dtype=self.dtype)
 
     @nn.compact
     def __call__(self, hidden_states, residual=None, inference_params=None):
@@ -162,6 +167,7 @@ class Block(nn.Module):
 
 class MixerModel(nn.Module):
     config: MambaConfig
+    dtype: jnp.dtype = jnp.float32
     rms_norm: bool = False
 
     def setup(self):
@@ -169,10 +175,15 @@ class MixerModel(nn.Module):
         n_layer = self.config.n_layer
         vocab_size = self.config.vocab_size
 
-        self.embedding = nn.Embed(vocab_size, dim)
-        self.layers = [Block(self.config) for i in range(n_layer)]
+        self.embedding = nn.Embed(
+            vocab_size,
+            dim,
+            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            dtype=self.dtype,
+        )
+        self.layers = [Block(self.config, dtype=self.dtype) for i in range(n_layer)]
         self.norm_f = (
-            nn.LayerNorm(dim) if not self.rms_norm else nn.RMSNorm(dim)
+            nn.LayerNorm(dim, dtype=self.dtype) if not self.rms_norm else nn.RMSNorm(dim, dtype=self.dtype)
         )
 
     def __call__(self, input_ids, params: dict = None):
@@ -187,9 +198,10 @@ class MixerModel(nn.Module):
 
 class MambaLMHeadModel(nn.Module):
     config: MambaConfig
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.backbone = MixerModel(self.config)
+        self.backbone = MixerModel(self.config, dtype=self.dtype)
 
     def __call__(self, input_ids):
         hidden_states = self.backbone(input_ids)

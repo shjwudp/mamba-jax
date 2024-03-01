@@ -29,8 +29,6 @@ def get_model_and_train_state(cfg, eos_token_id):
     )
     model = FlaxMambaLMHeadModel(config)
     params = model.init_weights(jax.random.PRNGKey(42), (cfg.train.batch_size, cfg.model.seqlen))
-    if cfg.model.bf16:
-        params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
 
     adamw = optax.adamw(cfg.train.learning_rate)
     state = train_state.TrainState.create(apply_fn=model.__call__, params=params, tx=adamw)
