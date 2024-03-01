@@ -144,6 +144,8 @@ def train_and_evaluate_mamba(cfg: DictConfig):
             metrics["Validation Loss"] = eval_loss.item()
 
         if idx % cfg.train.log_interval == 0 or idx == len(train_dataloader):
+            eval_loss = evaluate(cfg, test_dataloader, model)
+            metrics["Validation Loss"] = eval_loss.item()
             metrics["Training Step Time"] = sum(step_time_stack) / len(step_time_stack)
             step_time_stack = []
             wandb.log(metrics, step=idx)
