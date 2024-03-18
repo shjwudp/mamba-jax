@@ -2,37 +2,33 @@ import time
 
 import datasets
 import hydra
-import jax
-import jax.numpy as jnp
-import optax
-from flax import linen as nn
-from flax.training import train_state
+import torch
 from omegaconf import DictConfig, OmegaConf
 from rich.console import Console
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from transformers import AutoTokenizer, DefaultDataCollator
+from einops import rearrange
 
 import dataset_utils
 import wandb
-from mamba_ssm_jax.modules.mamba_simple import MambaConfig, FlaxMambaLMHeadModel
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.config_mamba import MambaConfig
 
 
-def get_model_and_train_state(cfg, eos_token_id):
+def get_model(cfg):
     config = MambaConfig(
         d_model=cfg.model.d_model,
-        d_inner=cfg.model.d_inner,
-        d_state=cfg.model.d_state,
-        d_conv=cfg.model.d_conv,
         n_layer=cfg.model.n_layer,
         vocab_size=cfg.model.vocab_size,
-        eos_token_id=eos_token_id,
+        ssm_cfg=dict(
+            d_state=cfg.model.d_state,
+            d_conv=cfg.model.d_conv,
+        ),
     )
-    model = FlaxMambaLMHeadModel(config)
-    params = model.init_weights(jax.random.PRNGKey(42), (cfg.train.batch_size, cfg.model.seqlen))
+    model = MambaLMHeadModel(config)
 
-    adamw = optax.adamw(cfg.train.learning_rate)
-    state = train_state.TrainState.create(apply_fn=model.__call__, params=params, tx=adamw)
-    return model, state
+    return model
 
 
 def flatten_norm(grads):
@@ -41,7 +37,19 @@ def flatten_norm(grads):
     return jnp.sqrt(jnp.sum(jnp.square(flat_grads))).item()
 
 
-def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array):
+def get_gradient_norm(model):
+    max_norm = float('inf')
+    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm, norm_type=2.0)
+    return total_norm
+
+
+def calculate_norm_efficient(items, norm_type=2):
+    items = [item.detach().flatten() for item in items]
+    total_norm = torch.norm(torch.cat(items), norm_type)
+    return total_norm.item()
+
+
+def train_step(cfg: DictConfig, model: torch.nn.Module, batch: torch.Tensor):
     """Trains one step."""
     B = batch.shape[0]
     mbs = cfg.train.micro_batch_size
@@ -49,38 +57,34 @@ def train_step(cfg: DictConfig, state: train_state.TrainState, batch: jax.Array)
     assert B % mbs == 0, f"B={B}, mbs={mbs}"
     num_micro_batches = B // mbs
 
-    def compute_loss(params, input_ids):
+    def compute_loss(model, input_ids):
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
-        output = state.apply_fn(inputs, params=params)
-        targets = jax.nn.one_hot(labels, num_classes=vocab_size)
-        loss = optax.softmax_cross_entropy(output.logits, targets)
-        return loss.mean(), output.logits
+        output = model(inputs)
+        loss = F.cross_entropy(
+            rearrange(output.logits, "b s v -> (b s) v"),
+            rearrange(labels, "b s -> (b s)"),
+        )
 
-    grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
+        return loss
 
-    accum_grads = None
     accum_loss = 0.0
     for idx in range(num_micro_batches):
         minibatch = batch[idx * mbs : (idx + 1) * mbs, :]
-        (loss, _), grads = grad_fn(state.params, minibatch)
-        grads = jax.tree_map(lambda x: x / num_micro_batches, grads)
-        if accum_grads:
-            grads = jax.tree_map(jnp.add, accum_grads, grads)
-        accum_grads = grads
+
+        loss = compute_loss(model, minibatch)
         accum_loss += loss
 
-    grads = accum_grads
     loss = accum_loss / num_micro_batches
+    loss.backward()
 
-    state = state.apply_gradients(grads=grads)
     metrics = {
         "Train Loss": loss.mean().item(),
-        "Grads Norm": flatten_norm(grads),
-        "Parameters Norm": flatten_norm(state.params),
+        "Grads Norm": calculate_norm_efficient([p.grad for p in model.parameters() if p.grad is not None]),
+        "Parameters Norm": calculate_norm_efficient([p.data for p in model.parameters()]),
     }
 
-    return state, metrics
+    return metrics
 
 
 def evaluate(cfg, test_dataloader, model):
@@ -90,8 +94,10 @@ def evaluate(cfg, test_dataloader, model):
         inputs = input_ids[:, :-1]
         labels = input_ids[:, 1:]
         output = model(inputs)
-        targets = jax.nn.one_hot(labels, num_classes=cfg.model.vocab_size)
-        loss = optax.softmax_cross_entropy(output.logits, targets)
+        loss = F.cross_entropy(
+            rearrange(output.logits, "b s v -> (b s) v"),
+            rearrange(labels, "b s -> (b s)"),
+        )
 
         losses.append(loss.mean())
 
@@ -116,32 +122,24 @@ def train_and_evaluate_mamba(cfg: DictConfig):
     train_dataloader = DataLoader(
         dataset["train"],
         batch_size=cfg.train.batch_size,
-        collate_fn=DefaultDataCollator(return_tensors="np"),
+        collate_fn=DefaultDataCollator(return_tensors="pt"),
         drop_last=True,
     )
     test_dataloader = DataLoader(
         dataset["test"],
         batch_size=1,
-        collate_fn=DefaultDataCollator(return_tensors="np"),
+        collate_fn=DefaultDataCollator(return_tensors="pt"),
     )
 
     # Prepare model and train state
-    model, state = get_model_and_train_state(cfg, eos_token_id=tokenizer.eos_token_id)
+    model = get_model(cfg)
 
-    profile = cfg.train.get("profile", None)
     step_time_stack = []
     for idx, batch in enumerate(train_dataloader, start=1):
-        if profile and idx == profile.start_step:
-            jax.profiler.start_trace(**profile.trace_kwargs)
-
         input_ids = batch["input_ids"]
         start_time = time.time()
-        state, metrics = train_step(cfg, state, input_ids)
+        metrics = train_step(cfg, model, input_ids)
         step_time_stack.append(time.time() - start_time)
-
-        if idx % cfg.train.eval_interval == 0 or idx == len(train_dataloader):
-            eval_loss = evaluate(cfg, test_dataloader, model)
-            metrics["Validation Loss"] = eval_loss.item()
 
         if idx % cfg.train.log_interval == 0 or idx == len(train_dataloader):
             eval_loss = evaluate(cfg, test_dataloader, model)
@@ -151,16 +149,9 @@ def train_and_evaluate_mamba(cfg: DictConfig):
             wandb.log(metrics, step=idx)
             console.log(f"step-{idx}", metrics)
 
-        if idx % cfg.train.save_interval == 0 or idx == len(train_dataloader):
-            ckpt_dir = f"checkpoints/step-{idx}"
-            model.save_pretrained(ckpt_dir)
-            tokenizer.save_pretrained(ckpt_dir)
-
-        if profile and idx == profile.end_step:
-            jax.profiler.stop_trace()
-
     console.log(f"At the end of training, the metrics is:", metrics)
 
 
 if __name__ == "__main__":
+    torch.set_default_device('cuda')
     train_and_evaluate_mamba()
